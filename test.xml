@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <item>
+    <Name>Alice</Name>
+    <Age>30</Age>
+    <City>Tel Aviv</City>
+    <Score>95</Score>
+  </item>
+  <item>
+    <Name>Bob</Name>
+    <Age>25</Age>
+    <City>Jerusalem</City>
+    <Score>87</Score>
+  </item>
+  <item>
+    <Name>Charlie</Name>
+    <Age>35</Age>
+    <City>Haifa</City>
+    <Score>92</Score>
+  </item>
+</root>
