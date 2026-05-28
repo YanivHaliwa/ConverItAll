@@ -1,0 +1,1403 @@
+#!/usr/bin/env python3
+"""
+Universal File Converter
+Converts between various file formats using system tools
+Usage: con source_file target_format
+Example: con document.pdf docx
+         con video.mp4 mp3
+         con image.png jpg
+
+Created by Yaniv Haliwa (https://github.com/YanivHaliwa)
+"""
+#version 27.11.25
+
+import sys
+import os
+import html
+import base64
+import subprocess
+import shutil
+import struct
+import tempfile
+from pathlib import Path
+
+DEBUG = False
+
+# Format mappings and conversion strategies
+DOCUMENT_FORMATS = {
+    'pdf': ['libreoffice', 'pandoc'],
+    'docx': ['libreoffice', 'pandoc'],
+    'doc': ['libreoffice'],
+    'xlsx': ['libreoffice'],
+    'xls': ['libreoffice'],
+    'csv': ['libreoffice'],
+    'pptx': ['libreoffice'],
+    'ppt': ['libreoffice'],
+    'odt': ['libreoffice'],
+    'ods': ['libreoffice'],
+    'odp': ['libreoffice'],
+    'txt': ['pandoc', 'native'],
+    'md': ['pandoc', 'native'],
+    'html': ['pandoc', 'libreoffice'],
+    'rtf': ['libreoffice', 'pandoc'],
+    'epub': ['pandoc'],
+}
+
+IMAGE_FORMATS = {
+    'jpg': ['imagemagick'],
+    'jpeg': ['imagemagick'],
+    'png': ['imagemagick'],
+    'gif': ['imagemagick'],
+    'bmp': ['imagemagick'],
+    'webp': ['imagemagick'],
+    'svg': ['imagemagick'],
+    'ico': ['imagemagick'],
+    'tiff': ['imagemagick'],
+    'tif': ['imagemagick'],
+    'heic': ['heif-convert', 'imagemagick'],
+    'heif': ['heif-convert', 'imagemagick'],
+    'avif': ['imagemagick'],
+}
+
+AUDIO_FORMATS = {
+    'mp3': ['ffmpeg'],
+    'wav': ['ffmpeg'],
+    'flac': ['ffmpeg'],
+    'ogg': ['ffmpeg'],
+    'm4a': ['ffmpeg'],
+    'aac': ['ffmpeg'],
+    'wma': ['ffmpeg'],
+    'opus': ['ffmpeg'],
+}
+
+VIDEO_FORMATS = {
+    'mp4': ['ffmpeg'],
+    'avi': ['ffmpeg'],
+    'mkv': ['ffmpeg'],
+    'mov': ['ffmpeg'],
+    'webm': ['ffmpeg'],
+    'flv': ['ffmpeg'],
+    'wmv': ['ffmpeg'],
+    'mpg': ['ffmpeg'],
+    'mpeg': ['ffmpeg'],
+    'm4v': ['ffmpeg'],
+}
+
+DATA_FORMATS = {
+    'json': ['python3'],
+    'xml': ['python3'],
+    'yaml': ['python3'],
+    'yml': ['python3'],
+}
+
+ARCHIVE_FORMATS = {
+    'zip':     ['zip', 'unzip'],
+    'rar':     ['rar', 'unrar'],
+    '7z':      ['7z'],
+    'tar':     ['tar'],
+    'tar.gz':  ['tar'],
+    'tar.bz2': ['tar'],
+    'tar.xz':  ['tar'],
+    'tgz':     ['tar'],
+    'iso':     ['7z'],  # Can extract with 7z (read-only, cannot create)
+}
+
+# ============================================================================
+# Hebrew Text Fixing Functions (for PDF conversions)
+# ============================================================================
+
+def is_hebrew(char):
+    """Check if a character is Hebrew"""
+    return '\u0590' <= char <= '\u05FF'
+
+def reverse_hebrew_text(text):
+    """
+    Reverse Hebrew character sequences while preserving English, numbers, punctuation.
+    This fixes the reversed Hebrew bug from markitdown PDF conversions.
+    """
+    result = []
+    hebrew_buffer = []
+
+    for char in text:
+        if is_hebrew(char):
+            hebrew_buffer.append(char)
+        else:
+            if hebrew_buffer:
+                result.extend(reversed(hebrew_buffer))
+                hebrew_buffer = []
+            result.append(char)
+
+    if hebrew_buffer:
+        result.extend(reversed(hebrew_buffer))
+
+    return ''.join(result)
+
+def has_hebrew(text):
+    """Check if text contains any Hebrew characters"""
+    return any('\u0590' <= char <= '\u05FF' for char in text)
+
+def generate_html_with_smart_rtl(content, title="מסמך"):
+    """
+    Generate HTML with smart RTL support - LTR for English-only lines, RTL for Hebrew lines.
+    This ensures proper text direction per line.
+    """
+    html_header = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <style>
+        body {{
+            font-family: 'Arial', 'Helvetica', sans-serif;
+            direction: ltr;
+            text-align: left;
+            max-width: 1000px;
+            margin: 40px auto;
+            padding: 20px;
+            line-height: 1.8;
+            background-color: #f9f9f9;
+            color: #333;
+        }}
+        .container {{
+            background-color: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }}
+        h1, h2, h3, h4 {{
+            margin-top: 1.5em;
+            margin-bottom: 0.5em;
+            font-weight: bold;
+        }}
+        h1 {{ font-size: 2em; border-bottom: 2px solid #333; padding-bottom: 10px; }}
+        h2 {{ font-size: 1.5em; color: #444; }}
+        h3 {{ font-size: 1.2em; color: #555; }}
+        h4 {{ font-size: 1em; color: #666; }}
+        .rtl {{
+            direction: rtl;
+            text-align: right;
+        }}
+        .ltr {{
+            direction: ltr;
+            text-align: left;
+        }}
+        div {{
+            margin: 0.5em 0;
+        }}
+        br {{
+            margin: 0.25em 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+"""
+
+    html_footer = """
+    </div>
+</body>
+</html>
+"""
+
+    # Process content line by line with smart RTL/LTR detection
+    lines = content.split('\n')
+    html_content = []
+
+    for line in lines:
+        line = line.rstrip()
+
+        if not line:
+            html_content.append('<br>')
+            continue
+
+        # Determine direction based on presence of Hebrew
+        dir_class = 'rtl' if has_hebrew(line) else 'ltr'
+
+        # Handle markdown headers
+        if line.startswith('# '):
+            header_text = html.escape(line[2:])
+            html_content.append(f'<h1 class="{dir_class}">{header_text}</h1>')
+        elif line.startswith('## '):
+            header_text = html.escape(line[3:])
+            html_content.append(f'<h2 class="{dir_class}">{header_text}</h2>')
+        elif line.startswith('### '):
+            header_text = html.escape(line[4:])
+            html_content.append(f'<h3 class="{dir_class}">{header_text}</h3>')
+        elif line.startswith('#### '):
+            header_text = html.escape(line[5:])
+            html_content.append(f'<h4 class="{dir_class}">{header_text}</h4>')
+        else:
+            html_content.append(f'<div class="{dir_class}">{html.escape(line)}</div>')
+
+    return html_header + '\n'.join(html_content) + html_footer
+
+# ============================================================================
+
+def check_tool_available(tool):
+    """Check if a tool is available in the system"""
+    return shutil.which(tool) is not None
+
+def get_pdf_page_output_dir(source):
+    """Return the output directory used for multi-page PDF image exports."""
+    output_dir = source.parent / source.stem
+    if output_dir.exists() and not output_dir.is_dir():
+        raise RuntimeError(f"Output path exists and is not a folder: {output_dir}")
+    output_dir.mkdir(exist_ok=True)
+    return output_dir
+
+def get_page_number_from_path(path):
+    """Extract the numeric page suffix from a pdftoppm-generated filename."""
+    try:
+        return int(path.stem.rsplit('-', 1)[-1])
+    except (IndexError, ValueError):
+        return 0
+
+def get_png_dimensions(path):
+    """Read width and height directly from a PNG header."""
+    with path.open('rb') as f:
+        header = f.read(24)
+    if header[:8] != b'\x89PNG\r\n\x1a\n':
+        raise ValueError(f"Not a PNG file: {path}")
+    width, height = struct.unpack('>II', header[16:24])
+    return width, height
+
+def write_embedded_svg_from_png(source_png, output_svg):
+    """Create an SVG file that embeds the rendered PNG page as a data URI."""
+    width, height = get_png_dimensions(source_png)
+    png_base64 = base64.b64encode(source_png.read_bytes()).decode('ascii')
+    svg_content = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <image width="{width}" height="{height}" href="data:image/png;base64,{png_base64}" />
+</svg>
+"""
+    output_svg.write_text(svg_content, encoding='utf-8')
+
+def convert_rendered_pdf_page(temp_page, output_page, target_ext):
+    """Convert a rendered PNG page into the requested output format."""
+    if target_ext == 'png':
+        shutil.move(str(temp_page), str(output_page))
+        return None
+
+    if target_ext == 'svg':
+        write_embedded_svg_from_png(temp_page, output_page)
+        return None
+
+    if not check_tool_available('convert'):
+        return f"Converting PDF pages to .{target_ext} requires ImageMagick"
+
+    convert_cmd = ['convert', str(temp_page)]
+    if target_ext == 'ico':
+        convert_cmd.extend(['-resize', '256x256'])
+    convert_cmd.append(str(output_page))
+
+    if DEBUG:
+        print(f"[DEBUG] Running: {' '.join(convert_cmd)}")
+
+    convert_result = subprocess.run(
+        convert_cmd,
+        capture_output=True,
+        text=True,
+        timeout=120
+    )
+    if convert_result.returncode != 0 or not output_page.exists():
+        return convert_result.stderr.strip() if convert_result.stderr else "ImageMagick did not create the output file"
+    return None
+
+def get_file_category(extension, filename=''):
+    """Determine the category of a file based on its extension"""
+    ext = extension.lower().lstrip('.')
+
+    if ext in DOCUMENT_FORMATS:
+        return 'document', ext
+    elif ext in IMAGE_FORMATS:
+        return 'image', ext
+    elif ext in AUDIO_FORMATS:
+        return 'audio', ext
+    elif ext in VIDEO_FORMATS:
+        return 'video', ext
+    elif ext in ARCHIVE_FORMATS:
+        return 'archive', ext
+    elif ext in DATA_FORMATS:
+        return 'data', ext
+    else:
+        return None, None
+
+def convert_document(source, target_ext, source_ext):
+    """Convert document formats using LibreOffice or Pandoc"""
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    # Try LibreOffice first for office formats
+    if target_ext in ['pdf', 'docx', 'doc', 'xlsx', 'xls', 'csv', 'pptx', 'ppt', 'odt', 'ods', 'odp', 'rtf', 'html']:
+        if check_tool_available('libreoffice'):
+            try:
+                # For CSV, use filter with separator options
+                if target_ext == 'csv':
+                    cmd = [
+                        'libreoffice',
+                        '--headless',
+                        '--convert-to', 'csv:Text - txt - csv (StarCalc):44,34,76',
+                        '--outdir', str(source.parent),
+                        str(source)
+                    ]
+                else:
+                    cmd = [
+                        'libreoffice',
+                        '--headless',
+                        '--convert-to', target_ext,
+                        '--outdir', str(source.parent),
+                        str(source)
+                    ]
+
+                if DEBUG:
+                    print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                if result.returncode == 0 and target_file.exists():
+                    return True, str(target_file)
+                else:
+                    if DEBUG:
+                        print(f"[DEBUG] LibreOffice failed: {result.stderr}")
+            except subprocess.TimeoutExpired:
+                print("⚠️  Conversion timed out (60s limit)")
+                return False, "Timeout"
+            except Exception as e:
+                if DEBUG:
+                    print(f"[DEBUG] LibreOffice error: {e}")
+
+    # Try Pandoc for text-based formats
+    if target_ext in ['md', 'html', 'txt', 'docx', 'pdf', 'epub', 'rtf'] and source_ext in ['md', 'html', 'txt', 'docx', 'rtf']:
+        if check_tool_available('pandoc'):
+            try:
+                cmd = [
+                    'pandoc',
+                    str(source),
+                    '-o', str(target_file)
+                ]
+
+                if DEBUG:
+                    print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                if result.returncode == 0 and target_file.exists():
+                    return True, str(target_file)
+                else:
+                    if DEBUG:
+                        print(f"[DEBUG] Pandoc failed: {result.stderr}")
+            except subprocess.TimeoutExpired:
+                print("⚠️  Conversion timed out (60s limit)")
+                return False, "Timeout"
+            except Exception as e:
+                if DEBUG:
+                    print(f"[DEBUG] Pandoc error: {e}")
+
+    return False, "No suitable converter found"
+
+def convert_pdf(source, target_ext, source_ext):
+    """
+    Convert PDF to MD, TXT, or HTML using pdftotext (primary) with markitdown fallback.
+    Prioritizes pdftotext for speed and reliability, falling back to markitdown on failure.
+    """
+    target_file = source.with_suffix(f'.{target_ext}')
+    used_pdftotext = False
+
+    # ===== PRIMARY METHOD: pdftotext =====
+    if check_tool_available('pdftotext'):
+        try:
+            print("⏳ Extracting text from PDF using pdftotext...")
+            cmd = ['pdftotext', '-layout', '-enc', 'UTF-8', str(source), '-']
+
+            if DEBUG:
+                print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+            # Run pdftotext with 20-second timeout
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+
+            # Check for successful execution
+            if result.returncode == 0 and result.stdout.strip():
+                used_pdftotext = True
+                extracted_content = result.stdout
+
+                if DEBUG:
+                    print(f"[DEBUG] pdftotext succeeded, extracted {len(extracted_content)} characters")
+
+                # Step: Generate output based on target format (pdftotext handles Hebrew correctly)
+                if target_ext == 'md':
+                    # Save as markdown
+                    with open(target_file, 'w', encoding='utf-8') as f:
+                        f.write(extracted_content)
+                    print(f"✅ Conversion successful using pdftotext")
+                    return True, str(target_file)
+
+                elif target_ext == 'txt':
+                    # Prepend RTL mark only when the content actually contains Hebrew
+                    rtl_mark = '\u200F' if has_hebrew(extracted_content) else ''
+                    with open(target_file, 'w', encoding='utf-8') as f:
+                        f.write(rtl_mark + extracted_content)
+                    print(f"✅ Conversion successful using pdftotext")
+                    return True, str(target_file)
+
+                elif target_ext == 'html':
+                    # Generate smart RTL/LTR HTML (pdftotext preserves Hebrew correctly)
+                    html_content = generate_html_with_smart_rtl(extracted_content, title=source.stem)
+                    with open(target_file, 'w', encoding='utf-8') as f:
+                        f.write(html_content)
+                    print(f"✅ Conversion successful using pdftotext")
+                    return True, str(target_file)
+
+            else:
+                # pdftotext failed or had warnings - silently fallback to markitdown
+                if DEBUG:
+                    if result.returncode != 0:
+                        print(f"[DEBUG] pdftotext failed (exit code {result.returncode}), falling back to markitdown")
+                    else:
+                        print(f"[DEBUG] pdftotext produced no output, falling back to markitdown")
+                # No warning message to user, continue to markitdown fallback
+
+        except subprocess.TimeoutExpired:
+            # pdftotext timed out after 20 seconds - silently fallback
+            if DEBUG:
+                print(f"[DEBUG] pdftotext timed out after 20 seconds, falling back to markitdown")
+            # No warning message to user, continue to markitdown fallback
+
+        except Exception as e:
+            # Any other error with pdftotext - silently fallback
+            if DEBUG:
+                print(f"[DEBUG] pdftotext error: {e}, falling back to markitdown")
+            # No warning message to user, continue to markitdown fallback
+
+    else:
+        if DEBUG:
+            print(f"[DEBUG] pdftotext not available, using markitdown")
+
+    # ===== FALLBACK METHOD: markitdown =====
+    if not used_pdftotext:
+        if not check_tool_available('markitdown'):
+            return False, "pdftotext failed and markitdown not installed (pip3 install --break-system-packages markitdown)"
+
+        try:
+            # Step 1: Use markitdown to convert PDF to markdown
+            print("⏳ Extracting text from PDF using markitdown...")
+            cmd = ['markitdown', str(source)]
+
+            if DEBUG:
+                print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+            if result.returncode != 0:
+                return False, f"markitdown error: {result.stderr}"
+
+            # Step 2: Apply Hebrew fixing to the extracted content (markitdown reverses Hebrew)
+            markdown_content = result.stdout
+
+            if DEBUG:
+                print(f"[DEBUG] Applying Hebrew text fixing for markitdown output...")
+
+            # Fix reversed Hebrew characters line by line
+            lines = markdown_content.split('\n')
+            fixed_lines = [reverse_hebrew_text(line) for line in lines]
+            fixed_content = '\n'.join(fixed_lines)
+
+            # Step 3: Generate output based on target format
+            if target_ext == 'md':
+                # Save as markdown
+                with open(target_file, 'w', encoding='utf-8') as f:
+                    f.write(fixed_content)
+                print(f"✅ Conversion successful using markitdown")
+                return True, str(target_file)
+
+            elif target_ext == 'txt':
+                # Prepend RTL mark only when the content actually contains Hebrew
+                rtl_mark = '\u200F' if has_hebrew(fixed_content) else ''
+                with open(target_file, 'w', encoding='utf-8') as f:
+                    f.write(rtl_mark + fixed_content)
+                print(f"✅ Conversion successful using markitdown")
+                return True, str(target_file)
+
+            elif target_ext == 'html':
+                # Generate smart RTL/LTR HTML
+                html_content = generate_html_with_smart_rtl(fixed_content, title=source.stem)
+                with open(target_file, 'w', encoding='utf-8') as f:
+                    f.write(html_content)
+                print(f"✅ Conversion successful using markitdown")
+                return True, str(target_file)
+
+            else:
+                return False, f"Unsupported PDF target format: {target_ext}"
+
+        except subprocess.TimeoutExpired:
+            return False, "PDF conversion timed out (600s limit)"
+        except Exception as e:
+            if DEBUG:
+                print(f"[DEBUG] PDF conversion error: {e}")
+            return False, str(e)
+
+def convert_image(source, target_ext, source_ext):
+    """Convert image formats using ImageMagick"""
+    if not check_tool_available('convert'):
+        return False, "ImageMagick not installed (apt install imagemagick)"
+
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    try:
+        # Special handling for animated GIF input - extract only first frame
+        if source_ext == 'gif':
+            cmd = ['convert', f'{str(source)}[0]', str(target_file)]
+        else:
+            cmd = ['convert', str(source), str(target_file)]
+
+        if DEBUG:
+            print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if result.returncode == 0 and target_file.exists():
+            return True, str(target_file)
+        else:
+            return False, f"ImageMagick error: {result.stderr}"
+    except subprocess.TimeoutExpired:
+        return False, "Timeout"
+    except Exception as e:
+        return False, str(e)
+
+def convert_audio(source, target_ext, source_ext):
+    """Convert audio formats using FFmpeg"""
+    if not check_tool_available('ffmpeg'):
+        return False, "FFmpeg not installed (apt install ffmpeg)"
+
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    try:
+        # Quality settings based on format
+        cmd = ['ffmpeg', '-i', str(source), '-y']
+
+        # Add quality parameters
+        if target_ext == 'mp3':
+            cmd.extend(['-codec:a', 'libmp3lame', '-q:a', '2'])
+        elif target_ext == 'ogg':
+            cmd.extend(['-codec:a', 'libvorbis', '-q:a', '6'])
+        elif target_ext == 'flac':
+            cmd.extend(['-codec:a', 'flac'])
+        elif target_ext == 'aac':
+            cmd.extend(['-codec:a', 'aac', '-b:a', '192k'])
+
+        cmd.append(str(target_file))
+
+        if DEBUG:
+            print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode == 0 and target_file.exists():
+            return True, str(target_file)
+        else:
+            return False, f"FFmpeg error: {result.stderr.split('Error')[-1] if 'Error' in result.stderr else 'Conversion failed'}"
+    except subprocess.TimeoutExpired:
+        return False, "Timeout (5 min limit)"
+    except Exception as e:
+        return False, str(e)
+
+def convert_video(source, target_ext, source_ext):
+    """Convert video formats using FFmpeg"""
+    if not check_tool_available('ffmpeg'):
+        return False, "FFmpeg not installed (apt install ffmpeg)"
+
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    # Special case: video to audio extraction
+    if target_ext in AUDIO_FORMATS:
+        return convert_audio(source, target_ext, source_ext)
+
+    try:
+        # Basic conversion with codec selection
+        cmd = ['ffmpeg', '-i', str(source), '-y']
+
+        # Codec settings based on target format
+        if target_ext == 'mp4':
+            cmd.extend(['-codec:v', 'libx264', '-crf', '23', '-codec:a', 'aac', '-b:a', '192k'])
+        elif target_ext == 'webm':
+            cmd.extend(['-codec:v', 'libvpx-vp9', '-crf', '30', '-codec:a', 'libopus'])
+        elif target_ext == 'mkv':
+            cmd.extend(['-codec:v', 'copy', '-codec:a', 'copy'])
+
+        cmd.append(str(target_file))
+
+        if DEBUG:
+            print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+        print(f"⏳ Converting video... (this may take a while)")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if result.returncode == 0 and target_file.exists():
+            return True, str(target_file)
+        else:
+            return False, f"FFmpeg error: {result.stderr.split('Error')[-1] if 'Error' in result.stderr else 'Conversion failed'}"
+    except subprocess.TimeoutExpired:
+        return False, "Timeout (10 min limit)"
+    except Exception as e:
+        return False, str(e)
+
+def convert_video_to_gif(source, target_ext, source_ext):
+    """Convert video to animated GIF (first 10 seconds only)"""
+    if not check_tool_available('ffmpeg'):
+        return False, "FFmpeg not installed (apt install ffmpeg)"
+
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    try:
+        # Generate color palette for better quality GIF
+        palette_file = source.parent / f"{source.stem}_palette.png"
+        
+        # Create palette from first 10 seconds
+        palette_cmd = [
+            'ffmpeg', '-i', str(source),
+            '-t', '10',  # First 10 seconds only
+            '-vf', 'fps=10,scale=480:-1:flags=lanczos,palettegen',
+            '-y', str(palette_file)
+        ]
+        
+        if DEBUG:
+            print(f"[DEBUG] Generating palette: {' '.join(palette_cmd)}")
+        
+        result = subprocess.run(palette_cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode != 0 or not palette_file.exists():
+            return False, "Failed to generate color palette"
+        
+        # Convert to GIF using the palette (first 10 seconds)
+        gif_cmd = [
+            'ffmpeg', '-i', str(source),
+            '-i', str(palette_file),
+            '-t', '10',  # First 10 seconds only
+            '-lavfi', 'fps=10,scale=480:-1:flags=lanczos [x]; [x][1:v] paletteuse',
+            '-y', str(target_file)
+        ]
+        
+        if DEBUG:
+            print(f"[DEBUG] Creating GIF: {' '.join(gif_cmd)}")
+        
+        print(f"⏳ Converting video to animated GIF (first 10 seconds)...")
+        result = subprocess.run(gif_cmd, capture_output=True, text=True, timeout=120)
+        
+        # Clean up palette file
+        palette_file.unlink(missing_ok=True)
+        
+        if result.returncode == 0 and target_file.exists():
+            return True, str(target_file)
+        else:
+            return False, f"FFmpeg error: {result.stderr.split('Error')[-1] if 'Error' in result.stderr else 'Conversion failed'}"
+            
+    except subprocess.TimeoutExpired:
+        palette_file.unlink(missing_ok=True)
+        return False, "Timeout (2 min limit)"
+    except Exception as e:
+        palette_file.unlink(missing_ok=True)
+        return False, str(e)
+
+def convert_image_to_document(source, target_ext, source_ext):
+    """Convert image to document format (PDF, HTML, etc.)"""
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    if target_ext == 'pdf':
+        # Try img2pdf first (better quality, smaller size)
+        if check_tool_available('img2pdf'):
+            try:
+                cmd = ['img2pdf', str(source), '-o', str(target_file)]
+                if DEBUG:
+                    print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode == 0 and target_file.exists():
+                    return True, str(target_file)
+            except Exception as e:
+                if DEBUG:
+                    print(f"[DEBUG] img2pdf failed: {e}")
+
+        # Fallback to ImageMagick convert
+        if check_tool_available('convert'):
+            try:
+                cmd = ['convert', str(source), str(target_file)]
+                if DEBUG:
+                    print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode == 0 and target_file.exists():
+                    return True, str(target_file)
+                else:
+                    return False, f"ImageMagick error: {result.stderr}"
+            except Exception as e:
+                return False, str(e)
+
+        return False, "No PDF converter found (install img2pdf or imagemagick)"
+
+    elif target_ext == 'html':
+        # Create HTML with embedded image
+        try:
+            import base64
+            with open(source, 'rb') as img_file:
+                img_data = base64.b64encode(img_file.read()).decode('utf-8')
+
+            # Determine MIME type
+            mime_types = {
+                'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+                'png': 'image/png', 'gif': 'image/gif',
+                'bmp': 'image/bmp', 'webp': 'image/webp',
+                'svg': 'image/svg+xml', 'ico': 'image/x-icon'
+            }
+            mime_type = mime_types.get(source_ext, 'image/png')
+
+            safe_name = html.escape(source.name)
+            html_content = f'''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>{safe_name}</title>
+    <style>
+        body {{ margin: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f0f0f0; }}
+        img {{ max-width: 100%; max-height: 100vh; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }}
+    </style>
+</head>
+<body>
+    <img src="data:{mime_type};base64,{img_data}" alt="{safe_name}">
+</body>
+</html>'''
+
+            with open(target_file, 'w') as f:
+                f.write(html_content)
+
+            return True, str(target_file)
+        except Exception as e:
+            return False, f"HTML creation error: {e}"
+
+    return False, f"Image to {target_ext} not supported (only PDF and HTML work)"
+
+def convert_document_to_image(source, target_ext, source_ext, pdf_all_pages=False):
+    """Convert document to image format (PDF to PNG/JPG, etc.)"""
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    # PDF to image conversion
+    if source_ext == 'pdf':
+        if pdf_all_pages:
+            if not check_tool_available('pdftoppm'):
+                return False, "PDF to image requires pdftoppm (install poppler-utils)"
+
+            try:
+                output_dir = get_pdf_page_output_dir(source)
+            except RuntimeError as e:
+                return False, str(e)
+
+            for existing_file in output_dir.glob(f"{source.stem}-page-*.{target_ext}"):
+                existing_file.unlink(missing_ok=True)
+
+            with tempfile.TemporaryDirectory(prefix=f"{source.stem}-pages-") as temp_dir_name:
+                temp_dir = Path(temp_dir_name)
+                temp_prefix = str(temp_dir / f"{source.stem}-page")
+                cmd = ['pdftoppm', '-png', str(source), temp_prefix]
+
+                if DEBUG:
+                    print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                temp_pages = sorted(
+                    temp_dir.glob(f"{source.stem}-page-*.png"),
+                    key=get_page_number_from_path
+                )
+
+                if result.returncode != 0 or not temp_pages:
+                    error_detail = result.stderr.strip() if result.stderr else "pdftoppm did not create page images"
+                    return False, f"pdftoppm error: {error_detail}"
+
+                for temp_page in temp_pages:
+                    page_number = get_page_number_from_path(temp_page)
+                    output_page = output_dir / f"{source.stem}-page-{page_number}.{target_ext}"
+                    error_detail = convert_rendered_pdf_page(temp_page, output_page, target_ext)
+                    if error_detail:
+                        if target_ext in ['svg', 'ico']:
+                            return False, f"Failed to create .{target_ext} page output: {error_detail}"
+                        return False, f"ImageMagick error: {error_detail}"
+
+            return True, str(output_dir)
+
+        # Try pdftoppm first (better quality)
+        if check_tool_available('pdftoppm'):
+            try:
+                temp_prefix = str(target_file.with_suffix(''))
+                format_map = {
+                    'png': 'png',
+                    'jpg': 'jpeg', 'jpeg': 'jpeg',
+                    'tiff': 'tiff', 'tif': 'tiff'
+                }
+                output_format = format_map.get(target_ext, 'png')
+
+                cmd = ['pdftoppm', '-' + output_format, '-singlefile', str(source), temp_prefix]
+                if DEBUG:
+                    print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                # pdftoppm creates file with extension
+                created_file = Path(f"{temp_prefix}.{output_format if output_format != 'jpeg' else 'jpg'}")
+                if result.returncode == 0 and created_file.exists():
+                    if created_file != target_file:
+                        created_file.rename(target_file)
+                    return True, str(target_file)
+            except Exception as e:
+                if DEBUG:
+                    print(f"[DEBUG] pdftoppm failed: {e}")
+
+        # Fallback to ImageMagick convert
+        if check_tool_available('convert'):
+            try:
+                cmd = ['convert', '-density', '300', f'{str(source)}[0]', str(target_file)]
+                if DEBUG:
+                    print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                if result.returncode == 0 and target_file.exists():
+                    return True, str(target_file)
+                else:
+                    return False, f"ImageMagick error: {result.stderr}"
+            except Exception as e:
+                return False, str(e)
+
+        return False, "No PDF to image converter found (install poppler-utils or imagemagick)"
+
+    # Other document formats: convert to PDF first, then to image
+    else:
+        if check_tool_available('libreoffice'):
+            try:
+                cmd = [
+                    'libreoffice',
+                    '--headless',
+                    '--convert-to', 'pdf',
+                    '--outdir', str(source.parent),
+                    str(source)
+                ]
+
+                if DEBUG:
+                    print(f"[DEBUG] Converting to PDF first: {' '.join(cmd)}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                actual_temp_pdf = source.with_suffix('.pdf')
+
+                if result.returncode == 0 and actual_temp_pdf.exists():
+                    # Now convert PDF to image
+                    success, result_path = convert_document_to_image(actual_temp_pdf, target_ext, 'pdf')
+                    # Clean up temp PDF
+                    try:
+                        actual_temp_pdf.unlink()
+                    except:
+                        pass
+                    return success, result_path
+            except Exception as e:
+                if DEBUG:
+                    print(f"[DEBUG] Document to PDF failed: {e}")
+
+        return False, f"Cannot convert {source_ext} to image (LibreOffice not available)"
+
+def convert_video_to_image(source, target_ext, source_ext):
+    """Extract frame from video as image"""
+    if not check_tool_available('ffmpeg'):
+        return False, "FFmpeg not installed (apt install ffmpeg)"
+
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    try:
+        cmd = [
+            'ffmpeg', '-i', str(source),
+            '-ss', '00:00:00',
+            '-vframes', '1',
+            '-y',
+            str(target_file)
+        ]
+
+        if DEBUG:
+            print(f"[DEBUG] Running: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+        if result.returncode == 0 and target_file.exists():
+            return True, str(target_file)
+        else:
+            return False, f"FFmpeg error: {result.stderr.split('Error')[-1] if 'Error' in result.stderr else 'Frame extraction failed'}"
+    except subprocess.TimeoutExpired:
+        return False, "Timeout"
+    except Exception as e:
+        return False, str(e)
+
+def convert_data(source: Path, target_ext: str, source_ext: str):
+    """Convert data formats (JSON, XML, CSV, YAML) in-process."""
+    import json
+    import csv as csv_mod
+    import re
+    import xml.etree.ElementTree as ET
+    import xml.dom.minidom
+
+    target_file = source.with_suffix(f'.{target_ext}')
+
+    def read_json(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def read_xml(path):
+        tree = ET.parse(path)
+        root = tree.getroot()
+        if len(root) == 0:
+            return {root.tag: root.text}
+        result = []
+        for child in root:
+            item = {subchild.tag: subchild.text for subchild in child}
+            if item:
+                result.append(item)
+        return result if result else {child.tag: child.text for child in root}
+
+    def read_csv(path):
+        with open(path, 'r', encoding='utf-8') as f:
+            return list(csv_mod.DictReader(f))
+
+    def read_yaml(path):
+        try:
+            import yaml
+            with open(path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except ImportError:
+            raise RuntimeError("PyYAML not installed (pip3 install --break-system-packages pyyaml)")
+
+    def sanitize_tag(name):
+        name = re.sub(r'[^a-zA-Z0-9_.-]', '_', str(name))
+        if name and (name[0].isdigit() or name[0] in '.-'):
+            name = 'item_' + name
+        return name or 'item'
+
+    def write_json(data, path):
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+
+    def write_xml(data, path):
+        root = ET.Element("root")
+        if isinstance(data, list):
+            for item in data:
+                item_elem = ET.SubElement(root, "item")
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        child = ET.SubElement(item_elem, sanitize_tag(key))
+                        child.text = str(value) if value is not None else ''
+                else:
+                    item_elem.text = str(item) if item is not None else ''
+        elif isinstance(data, dict):
+            for key, value in data.items():
+                child = ET.SubElement(root, sanitize_tag(key))
+                child.text = str(value) if value is not None else ''
+        xml_bytes = ET.tostring(root, encoding='utf-8')
+        pretty = xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent="  ", encoding='utf-8')
+        with open(path, 'wb') as f:
+            f.write(pretty)
+
+    def write_csv(data, path):
+        if isinstance(data, dict):
+            data = [data]
+        if not data:
+            return
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv_mod.DictWriter(f, fieldnames=data[0].keys())
+            writer.writeheader()
+            writer.writerows(data)
+
+    def write_yaml(data, path):
+        try:
+            import yaml
+            with open(path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, allow_unicode=True, default_flow_style=False)
+        except ImportError:
+            raise RuntimeError("PyYAML not installed (pip3 install --break-system-packages pyyaml)")
+
+    try:
+        if source_ext == 'json':
+            data = read_json(source)
+        elif source_ext == 'xml':
+            data = read_xml(source)
+        elif source_ext == 'csv':
+            data = read_csv(source)
+        elif source_ext in ('yaml', 'yml'):
+            data = read_yaml(source)
+        else:
+            return False, f"Unsupported source format: {source_ext}"
+
+        if target_ext == 'json':
+            write_json(data, target_file)
+        elif target_ext == 'xml':
+            write_xml(data, target_file)
+        elif target_ext == 'csv':
+            write_csv(data, target_file)
+        elif target_ext in ('yaml', 'yml'):
+            write_yaml(data, target_file)
+        else:
+            return False, f"Unsupported target format: {target_ext}"
+
+        if target_file.exists():
+            return True, str(target_file)
+        return False, "Conversion produced no output"
+
+    except Exception as e:
+        if DEBUG:
+            import traceback
+            traceback.print_exc()
+        return False, str(e)
+def convert_archive(source, target_ext, source_ext):
+    """Convert archive formats by extracting and recompressing"""
+    import tempfile
+
+    # Strip all archive-related suffixes (.tar.gz → base, .tar → base)
+    name = source.name.lower()
+    for compound in ('tar.gz', 'tar.bz2', 'tar.xz', 'tgz'):
+        if name.endswith('.' + compound):
+            base_name = source.name[:-(len(compound) + 1)]
+            break
+    else:
+        base_name = source.stem
+
+    # Determine target filename
+    target_file = source.parent / f"{base_name}.{target_ext}"
+
+    # Create temp directory for extraction
+    temp_dir = Path(tempfile.mkdtemp(prefix='con_archive_'))
+
+    try:
+        # Extract source archive
+        print(f"⏳ Extracting {source.name}...")
+        extract_success = _extract_archive(source, temp_dir, source_ext)
+        if not extract_success:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return False, f"Failed to extract {source_ext} archive"
+
+        # Create target archive
+        print(f"⏳ Creating {target_ext} archive...")
+        compress_success = _create_archive(temp_dir, target_file, target_ext)
+        if not compress_success:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if target_ext == 'iso':
+                return False, f"ISO creation requires genisoimage or mkisofs (apt install genisoimage)"
+            return False, f"Failed to create {target_ext} archive"
+
+        # Clean up temp directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+        if target_file.exists():
+            return True, str(target_file)
+        else:
+            return False, "Archive created but file not found"
+
+    except Exception as e:
+        # Clean up on error
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        return False, f"Archive conversion error: {str(e)}"
+
+def _check_archive_safe(source: Path, source_ext: str) -> bool:
+    """Pre-extraction check for path traversal (zip slip protection)."""
+    try:
+        if source_ext == 'zip':
+            cmd = ['unzip', '-l', str(source)]
+        elif source_ext == 'rar':
+            cmd = ['unrar', 'l', str(source)]
+        elif source_ext in ('7z', 'iso'):
+            cmd = ['7z', 'l', str(source)]
+        elif source_ext in ('tar', 'tar.gz', 'tgz', 'tar.bz2', 'tar.xz'):
+            cmd = ['tar', 'tf', str(source)]
+        else:
+            return True
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return True  # can't list contents, proceed
+
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if '../' in stripped or stripped.startswith('/'):
+                return False
+        return True
+    except Exception:
+        return True
+
+
+def _extract_archive(source, temp_dir, source_ext):
+    """Extract archive to temp directory using native tool for source format"""
+    if not _check_archive_safe(source, source_ext):
+        if DEBUG:
+            print(f"[DEBUG] Archive rejected: path traversal detected")
+        return False
+
+    try:
+        if source_ext == 'zip':
+            cmd = ['unzip', '-q', str(source), '-d', str(temp_dir)]
+        elif source_ext == 'rar':
+            cmd = ['unrar', 'x', '-y', str(source), str(temp_dir) + '/']
+        elif source_ext == '7z':
+            cmd = ['7z', 'x', f'-o{temp_dir}', '-y', str(source)]
+        elif source_ext in ('tar', 'tar.gz', 'tgz', 'tar.bz2', 'tar.xz'):
+            cmd = ['tar', 'xf', str(source), '-C', str(temp_dir)]
+        elif source_ext == 'iso':
+            cmd = ['7z', 'x', f'-o{temp_dir}', '-y', str(source)]
+        else:
+            return False
+
+        if DEBUG:
+            print(f"[DEBUG] Extract: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return result.returncode == 0
+
+    except Exception as e:
+        if DEBUG:
+            print(f"[DEBUG] Extract error: {e}")
+        return False
+
+def _create_archive(temp_dir, target_file, target_ext):
+    """Create archive from temp directory contents using native tool for target format"""
+    try:
+        items = list(temp_dir.iterdir())
+        if not items:
+            return False
+
+        item_names = [item.name for item in items]
+        target_file_abs = str(target_file.resolve())
+
+        if target_ext == 'zip':
+            cmd = ['zip', '-r', '-q', target_file_abs] + item_names
+        elif target_ext == 'rar':
+            cmd = ['rar', 'a', '-r', '-ep1', target_file_abs] + item_names
+        elif target_ext == '7z':
+            cmd = ['7z', 'a', target_file_abs] + item_names
+        elif target_ext == 'tar':
+            cmd = ['tar', 'cf', target_file_abs] + item_names
+        elif target_ext == 'iso':
+            if DEBUG:
+                print("[DEBUG] ISO creation requires genisoimage or mkisofs")
+            if check_tool_available('genisoimage'):
+                cmd = ['genisoimage', '-o', target_file_abs, '-R', '-J'] + item_names
+            elif check_tool_available('mkisofs'):
+                cmd = ['mkisofs', '-o', target_file_abs, '-R', '-J'] + item_names
+            else:
+                return False
+        else:
+            return False
+
+        if DEBUG:
+            print(f"[DEBUG] Create: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=str(temp_dir))
+
+        if DEBUG and result.returncode != 0:
+            print(f"[DEBUG] Create failed - returncode: {result.returncode}")
+            print(f"[DEBUG] stderr: {result.stderr}")
+            print(f"[DEBUG] stdout: {result.stdout}")
+
+        return result.returncode == 0
+
+    except Exception as e:
+        if DEBUG:
+            print(f"[DEBUG] Create archive error: {e}")
+        return False
+
+def show_help():
+    """Display comprehensive help message"""
+    print("Universal File Converter")
+    print("\nUsage: con <source_file> <target_format>")
+
+    print("\n" + "="*70)
+    print("📝 SUPPORTED FORMATS & CONVERSIONS")
+    print("="*70)
+
+    print("\n🗂️  DOCUMENTS:")
+    print("   ├─ PDF Files: PDF")
+    print("   │  → Can convert to: MD, TXT, HTML (with automatic Hebrew text fixing)")
+    print("   │  → Can convert to images: AVIF, BMP, GIF, HEIC, HEIF, ICO, JPEG, JPG, PNG, SVG, TIF, TIFF, WEBP")
+    print("   │  → PDF → image exports all pages into a folder named after the PDF file")
+    print("   │  → Uses pdftotext (fast) with markitdown fallback + smart RTL/LTR")
+    print("   │  ⚠️  Image-based PDFs (scanned/converted from image) have no text layer —")
+    print("   │     converting to MD/TXT/HTML will produce empty output. Images cannot")
+    print("   │     be converted to any text format.")
+    print("   ├─ Word Documents: DOCX, DOC, ODT, RTF")
+    print("   │  → Can convert to: PDF, DOCX, DOC, ODT, RTF, TXT, HTML, MD")
+    print("   ├─ Text Documents: MD, TXT, HTML")
+    print("   │  → Can convert to: PDF, DOCX, DOC, ODT, RTF, HTML, MD, EPUB")
+    print("   ├─ Spreadsheets: XLSX, XLS, ODS, CSV")
+    print("   │  → Can convert to: PDF, XLSX, XLS, ODS, CSV, JSON, XML, YAML")
+    print("   └─ Presentations: PPTX, PPT, ODP")
+    print("       → Can convert to: PDF, PPTX, PPT, ODP")
+
+    print("\n🖼️  IMAGES → Can convert to images or documents:")
+    print("   ├─ Images: " + ", ".join(sorted(IMAGE_FORMATS.keys())))
+    print("   ├─ Documents: pdf, html")
+    print("   └─ Note: Animated GIF → any image format extracts first frame only")
+
+    print("\n🎵 AUDIO → Can convert to audio:")
+    print("   └─ Audio: " + ", ".join(sorted(AUDIO_FORMATS.keys())))
+
+    print("\n🎬 VIDEO → Can convert to video or audio or image:")
+    print("   ├─ Video: " + ", ".join(sorted(VIDEO_FORMATS.keys())))
+    print("   ├─ Audio: " + ", ".join(sorted(AUDIO_FORMATS.keys())))
+    print("   ├─ GIF: animated GIF from first 10 seconds only")
+    print("   └─ Images: " + ", ".join(sorted(k for k in IMAGE_FORMATS if k != 'gif')) + " (extracts first frame)")
+
+    print("\n📦 ARCHIVES → Can convert to archives:")
+    print("   ├─ Source:  " + ", ".join(sorted(ARCHIVE_FORMATS.keys())))
+    print("   └─ Target:  zip, tar, 7z, rar  (compressed tars always extracted, repackaged)")
+
+    print("\n📊 DATA FORMATS → Can convert to data formats and spreadsheets:")
+    print("   ├─ Data Formats: JSON, XML, YAML")
+    print("   └─ Spreadsheets: XLSX, XLS, ODS, CSV")
+
+    print("\n" + "="*70)
+    print("💡 EXAMPLES")
+    print("="*70)
+    print("  con document.pdf md         con document.docx pdf   con image.png jpg")
+    print("  con video.mp4 mp3           con video.mp4 gif       con archive.zip rar")
+    print("  con data.json xml           con document.pdf html   (Hebrew auto-fixed)")
+    print("  con document.pdf png        → creates ./document/document-page-1.png, ...")
+    print("="*70)
+
+def main():
+    """Main conversion logic"""
+    # Check for special flags first (before argument count validation)
+    if len(sys.argv) > 1:
+        if sys.argv[1] in ['-h', '--help', 'help']:
+            show_help()
+            sys.exit(0)
+
+    # Now check argument count for actual conversion - show full help
+    if len(sys.argv) == 1:
+        show_help()
+        sys.exit(0)
+    if len(sys.argv) == 2:
+        show_help()
+        sys.exit(1)
+
+    source_path = sys.argv[1]
+    target_format = sys.argv[2].lower().lstrip('.')
+
+    # Validate source file
+    if not os.path.exists(source_path):
+        print(f"❌ Error: Source file '{source_path}' not found")
+        sys.exit(1)
+
+    source = Path(source_path).resolve()
+    # Detect compound extensions like .tar.gz before falling back to last suffix
+    _name_lower = source.name.lower()
+    _compound = next(
+        (ext for ext in ('tar.gz', 'tar.bz2', 'tar.xz', 'tgz') if _name_lower.endswith('.' + ext)),
+        None
+    )
+    source_ext = _compound if _compound else source.suffix.lower().lstrip('.')
+
+    # Determine file categories
+    source_category, source_ext_actual = get_file_category(source_ext, source.name)
+    target_category, target_ext_actual = get_file_category(target_format, target_format)
+
+    # Use actual detected extension if found
+    if source_ext_actual:
+        source_ext = source_ext_actual
+    if target_ext_actual:
+        target_format = target_ext_actual
+
+    if not source_category:
+        print(f"❌ Error: Unsupported source format '.{source_ext}'")
+        print("Run 'con --help' to see supported formats")
+        sys.exit(1)
+
+    if not target_category:
+        print(f"❌ Error: Unsupported target format '.{target_format}'")
+        print("Run 'con --help' to see supported formats")
+        sys.exit(1)
+
+    # Prevent same-format conversion
+    if source_ext == target_format:
+        print(f"⚠️  Source and target formats are the same (.{source_ext})")
+        sys.exit(0)
+
+    print(f"🔄 Converting: {source.name} → .{target_format}")
+
+    # Route to appropriate converter
+    success = False
+    error_msg = None
+
+    # Special handling for PDF source files (using markitdown with Hebrew fixing)
+    if source_ext == 'pdf' and target_format in ['md', 'txt', 'html']:
+        success, result = convert_pdf(source, target_format, source_ext)
+    # Same category conversions
+    elif source_category == 'document' and target_category == 'document':
+        success, result = convert_document(source, target_format, source_ext)
+    elif source_category == 'image' and target_category == 'image':
+        success, result = convert_image(source, target_format, source_ext)
+    elif source_category == 'audio' and target_category == 'audio':
+        success, result = convert_audio(source, target_format, source_ext)
+    elif source_category == 'video' and target_category == 'video':
+        success, result = convert_video(source, target_format, source_ext)
+    elif source_category == 'archive' and target_category == 'archive':
+        success, result = convert_archive(source, target_format, source_ext)
+    elif source_category == 'data' and target_category == 'data':
+        success, result = convert_data(source, target_format, source_ext)
+
+    # Cross-category conversions
+    elif source_category == 'document' and target_category == 'image':
+        success, result = convert_document_to_image(
+            source,
+            target_format,
+            source_ext,
+            pdf_all_pages=(source_ext == 'pdf')
+        )
+    elif source_category == 'image' and target_category == 'document':
+        success, result = convert_image_to_document(source, target_format, source_ext)
+    elif source_category == 'video' and target_category == 'audio':
+        success, result = convert_video(source, target_format, source_ext)
+    elif source_category == 'video' and target_category == 'image' and target_format == 'gif':
+        success, result = convert_video_to_gif(source, target_format, source_ext)
+    elif source_category == 'video' and target_category == 'image':
+        success, result = convert_video_to_image(source, target_format, source_ext)
+    elif source_category == 'data' and target_category == 'document' and target_format == 'csv':
+        success, result = convert_data(source, target_format, source_ext)
+    elif source_category == 'document' and source_ext == 'csv' and target_category == 'data':
+        success, result = convert_data(source, target_format, source_ext)
+    elif source_category == 'document' and source_ext in ['xlsx', 'xls', 'ods'] and target_category == 'data':
+        # Excel to data formats: convert to CSV first, then to target data format
+        print(f"⏳ Converting spreadsheet to CSV first...")
+        csv_success, csv_result = convert_document(source, 'csv', source_ext)
+        if csv_success:
+            success, result = convert_data(Path(csv_result), target_format, 'csv')
+            Path(csv_result).unlink(missing_ok=True)
+        else:
+            success, result = False, "Failed to convert spreadsheet to CSV"
+    elif source_category == 'data' and target_category == 'document' and target_format in ['xlsx', 'xls', 'ods']:
+        # Data formats to Excel: convert to CSV first, then to target Excel format
+        print(f"⏳ Converting data to CSV first...")
+        csv_success, csv_result = convert_data(source, 'csv', source_ext)
+        if csv_success:
+            success, result = convert_document(Path(csv_result), target_format, 'csv')
+            Path(csv_result).unlink(missing_ok=True)
+        else:
+            success, result = False, "Failed to convert data to CSV"
+
+    # Unsupported cross-category conversions
+    else:
+        error_msg = f"Cannot convert {source_category} to {target_category}"
+
+    if success:
+        print(f"✅ Converted successfully: {result}")
+        sys.exit(0)
+    else:
+        print(f"❌ Conversion failed: {result if not error_msg else error_msg}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠️  Conversion cancelled by user")
+        sys.exit(130)
+    except Exception as e:
+        print(f"❌ Unexpected error: {e}")
+        if DEBUG:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
