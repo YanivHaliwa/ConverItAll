@@ -68,7 +68,13 @@ AUDIO_FORMATS = {
     'aac': ['ffmpeg'],
     'wma': ['ffmpeg'],
     'opus': ['ffmpeg'],
+    'amr': ['ffmpeg'],
+    '3ga': ['ffmpeg'],
 }
+
+# Formats FFmpeg can READ but not WRITE (no encoder in the standard build).
+# Valid as a conversion source, rejected with a clear message as a target.
+DECODE_ONLY_AUDIO = {'amr', '3ga'}
 
 VIDEO_FORMATS = {
     'mp4': ['ffmpeg'],
@@ -91,15 +97,11 @@ DATA_FORMATS = {
 }
 
 ARCHIVE_FORMATS = {
-    'zip':     ['zip', 'unzip'],
-    'rar':     ['rar', 'unrar'],
-    '7z':      ['7z'],
-    'tar':     ['tar'],
-    'tar.gz':  ['tar'],
-    'tar.bz2': ['tar'],
-    'tar.xz':  ['tar'],
-    'tgz':     ['tar'],
-    'iso':     ['7z'],  # Can extract with 7z (read-only, cannot create)
+    'zip': ['zip', 'unzip'],
+    'rar': ['rar', 'unrar'],
+    '7z': ['7z'],
+    'tar': ['tar'],
+    'iso': ['7z'],  # Can extract with 7z (read-only, cannot create)
 }
 
 # ============================================================================
@@ -216,19 +218,19 @@ def generate_html_with_smart_rtl(content, title="מסמך"):
 
         # Handle markdown headers
         if line.startswith('# '):
-            header_text = html.escape(line[2:])
+            header_text = line[2:]
             html_content.append(f'<h1 class="{dir_class}">{header_text}</h1>')
         elif line.startswith('## '):
-            header_text = html.escape(line[3:])
+            header_text = line[3:]
             html_content.append(f'<h2 class="{dir_class}">{header_text}</h2>')
         elif line.startswith('### '):
-            header_text = html.escape(line[4:])
+            header_text = line[4:]
             html_content.append(f'<h3 class="{dir_class}">{header_text}</h3>')
         elif line.startswith('#### '):
-            header_text = html.escape(line[5:])
+            header_text = line[5:]
             html_content.append(f'<h4 class="{dir_class}">{header_text}</h4>')
         else:
-            html_content.append(f'<div class="{dir_class}">{html.escape(line)}</div>')
+            html_content.append(f'<div class="{dir_class}">{line}</div>')
 
     return html_header + '\n'.join(html_content) + html_footer
 
@@ -414,8 +416,8 @@ def convert_pdf(source, target_ext, source_ext):
             # Run pdftotext with 20-second timeout
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
 
-            # Check for successful execution
-            if result.returncode == 0 and result.stdout.strip():
+            # Check for successful execution WITHOUT stderr warnings
+            if result.returncode == 0 and result.stdout.strip() and not result.stderr.strip():
                 used_pdftotext = True
                 extracted_content = result.stdout
 
@@ -431,8 +433,8 @@ def convert_pdf(source, target_ext, source_ext):
                     return True, str(target_file)
 
                 elif target_ext == 'txt':
-                    # Prepend RTL mark only when the content actually contains Hebrew
-                    rtl_mark = '\u200F' if has_hebrew(extracted_content) else ''
+                    # Save as plain text with RTL marker for proper Hebrew display
+                    rtl_mark = '\u200F'  # RIGHT-TO-LEFT MARK
                     with open(target_file, 'w', encoding='utf-8') as f:
                         f.write(rtl_mark + extracted_content)
                     print(f"✅ Conversion successful using pdftotext")
@@ -449,7 +451,10 @@ def convert_pdf(source, target_ext, source_ext):
             else:
                 # pdftotext failed or had warnings - silently fallback to markitdown
                 if DEBUG:
-                    if result.returncode != 0:
+                    if result.returncode == 0 and result.stdout.strip() and result.stderr.strip():
+                        print(f"[DEBUG] pdftotext had warnings, falling back to markitdown")
+                        print(f"[DEBUG] stderr: {result.stderr[:500]}")
+                    elif result.returncode != 0:
                         print(f"[DEBUG] pdftotext failed (exit code {result.returncode}), falling back to markitdown")
                     else:
                         print(f"[DEBUG] pdftotext produced no output, falling back to markitdown")
@@ -509,8 +514,8 @@ def convert_pdf(source, target_ext, source_ext):
                 return True, str(target_file)
 
             elif target_ext == 'txt':
-                # Prepend RTL mark only when the content actually contains Hebrew
-                rtl_mark = '\u200F' if has_hebrew(fixed_content) else ''
+                # Save as plain text with RTL marker
+                rtl_mark = '\u200F'  # RIGHT-TO-LEFT MARK for proper text editor display
                 with open(target_file, 'w', encoding='utf-8') as f:
                     f.write(rtl_mark + fixed_content)
                 print(f"✅ Conversion successful using markitdown")
@@ -566,6 +571,10 @@ def convert_audio(source, target_ext, source_ext):
     """Convert audio formats using FFmpeg"""
     if not check_tool_available('ffmpeg'):
         return False, "FFmpeg not installed (apt install ffmpeg)"
+
+    if target_ext in DECODE_ONLY_AUDIO:
+        return False, (f"'{target_ext}' is read-only: FFmpeg has no {target_ext.upper()} "
+                       f"encoder. Use it as a source, not a target (try mp3, m4a or wav)")
 
     target_file = source.with_suffix(f'.{target_ext}')
 
@@ -704,11 +713,32 @@ def convert_image_to_document(source, target_ext, source_ext):
         # Try img2pdf first (better quality, smaller size)
         if check_tool_available('img2pdf'):
             try:
-                cmd = ['img2pdf', str(source), '-o', str(target_file)]
+                # img2pdf ignores EXIF orientation and sizes the page from the
+                # raw pixel data, which cuts off photos taken in portrait mode.
+                # Bake the EXIF rotation into the pixels first so page size matches.
+                img2pdf_source = source
+                oriented_temp = None
+                try:
+                    from PIL import Image, ImageOps
+                    with Image.open(source) as img:
+                        oriented = ImageOps.exif_transpose(img)
+                        if oriented is not img:
+                            oriented_temp = source.with_name(f"{source.stem}_oriented{source.suffix}")
+                            oriented.save(oriented_temp)
+                            img2pdf_source = oriented_temp
+                except Exception as e:
+                    if DEBUG:
+                        print(f"[DEBUG] EXIF auto-orient skipped: {e}")
+
+                cmd = ['img2pdf', str(img2pdf_source), '-o', str(target_file)]
                 if DEBUG:
                     print(f"[DEBUG] Running: {' '.join(cmd)}")
 
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+                if oriented_temp:
+                    oriented_temp.unlink(missing_ok=True)
+
                 if result.returncode == 0 and target_file.exists():
                     return True, str(target_file)
             except Exception as e:
@@ -907,7 +937,7 @@ def convert_video_to_image(source, target_ext, source_ext):
     try:
         cmd = [
             'ffmpeg', '-i', str(source),
-            '-ss', '00:00:00',
+            '-ss', '00:00:01',
             '-vframes', '1',
             '-y',
             str(target_file)
@@ -1049,14 +1079,8 @@ def convert_archive(source, target_ext, source_ext):
     """Convert archive formats by extracting and recompressing"""
     import tempfile
 
-    # Strip all archive-related suffixes (.tar.gz → base, .tar → base)
-    name = source.name.lower()
-    for compound in ('tar.gz', 'tar.bz2', 'tar.xz', 'tgz'):
-        if name.endswith('.' + compound):
-            base_name = source.name[:-(len(compound) + 1)]
-            break
-    else:
-        base_name = source.stem
+    # Get base name without any archive extensions
+    base_name = source.stem
 
     # Determine target filename
     target_file = source.parent / f"{base_name}.{target_ext}"
@@ -1103,7 +1127,7 @@ def _check_archive_safe(source: Path, source_ext: str) -> bool:
             cmd = ['unrar', 'l', str(source)]
         elif source_ext in ('7z', 'iso'):
             cmd = ['7z', 'l', str(source)]
-        elif source_ext in ('tar', 'tar.gz', 'tgz', 'tar.bz2', 'tar.xz'):
+        elif source_ext == 'tar':
             cmd = ['tar', 'tf', str(source)]
         else:
             return True
@@ -1135,7 +1159,7 @@ def _extract_archive(source, temp_dir, source_ext):
             cmd = ['unrar', 'x', '-y', str(source), str(temp_dir) + '/']
         elif source_ext == '7z':
             cmd = ['7z', 'x', f'-o{temp_dir}', '-y', str(source)]
-        elif source_ext in ('tar', 'tar.gz', 'tgz', 'tar.bz2', 'tar.xz'):
+        elif source_ext == 'tar':
             cmd = ['tar', 'xf', str(source), '-C', str(temp_dir)]
         elif source_ext == 'iso':
             cmd = ['7z', 'x', f'-o{temp_dir}', '-y', str(source)]
@@ -1233,17 +1257,16 @@ def show_help():
     print("   └─ Note: Animated GIF → any image format extracts first frame only")
 
     print("\n🎵 AUDIO → Can convert to audio:")
-    print("   └─ Audio: " + ", ".join(sorted(AUDIO_FORMATS.keys())))
+    print("   └─ Audio: " + ", ".join(sorted(AUDIO_FORMATS)) +
+          "  (" + ", ".join(sorted(DECODE_ONLY_AUDIO)) + " = input only)")
 
-    print("\n🎬 VIDEO → Can convert to video or audio or image:")
+    print("\n🎬 VIDEO → Can convert to video or audio or GIF:")
     print("   ├─ Video: " + ", ".join(sorted(VIDEO_FORMATS.keys())))
-    print("   ├─ Audio: " + ", ".join(sorted(AUDIO_FORMATS.keys())))
-    print("   ├─ GIF: animated GIF from first 10 seconds only")
-    print("   └─ Images: " + ", ".join(sorted(k for k in IMAGE_FORMATS if k != 'gif')) + " (extracts first frame)")
+    print("   ├─ Audio: " + ", ".join(sorted(set(AUDIO_FORMATS) - DECODE_ONLY_AUDIO)))
+    print("   └─ Images: GIF (first 10 seconds only)")
 
     print("\n📦 ARCHIVES → Can convert to archives:")
-    print("   ├─ Source:  " + ", ".join(sorted(ARCHIVE_FORMATS.keys())))
-    print("   └─ Target:  zip, tar, 7z, rar  (compressed tars always extracted, repackaged)")
+    print("   └─ Archives: " + ", ".join(sorted(ARCHIVE_FORMATS.keys())))
 
     print("\n📊 DATA FORMATS → Can convert to data formats and spreadsheets:")
     print("   ├─ Data Formats: JSON, XML, YAML")
@@ -1283,13 +1306,7 @@ def main():
         sys.exit(1)
 
     source = Path(source_path).resolve()
-    # Detect compound extensions like .tar.gz before falling back to last suffix
-    _name_lower = source.name.lower()
-    _compound = next(
-        (ext for ext in ('tar.gz', 'tar.bz2', 'tar.xz', 'tgz') if _name_lower.endswith('.' + ext)),
-        None
-    )
-    source_ext = _compound if _compound else source.suffix.lower().lstrip('.')
+    source_ext = source.suffix.lower().lstrip('.')
 
     # Determine file categories
     source_category, source_ext_actual = get_file_category(source_ext, source.name)
@@ -1353,8 +1370,6 @@ def main():
         success, result = convert_video(source, target_format, source_ext)
     elif source_category == 'video' and target_category == 'image' and target_format == 'gif':
         success, result = convert_video_to_gif(source, target_format, source_ext)
-    elif source_category == 'video' and target_category == 'image':
-        success, result = convert_video_to_image(source, target_format, source_ext)
     elif source_category == 'data' and target_category == 'document' and target_format == 'csv':
         success, result = convert_data(source, target_format, source_ext)
     elif source_category == 'document' and source_ext == 'csv' and target_category == 'data':
@@ -1371,6 +1386,7 @@ def main():
     elif source_category == 'data' and target_category == 'document' and target_format in ['xlsx', 'xls', 'ods']:
         # Data formats to Excel: convert to CSV first, then to target Excel format
         print(f"⏳ Converting data to CSV first...")
+        csv_temp = source.with_suffix('.temp.csv')
         csv_success, csv_result = convert_data(source, 'csv', source_ext)
         if csv_success:
             success, result = convert_document(Path(csv_result), target_format, 'csv')
